@@ -1078,6 +1078,30 @@ class BookEngine:
         params_override: dict[str, Any] | None = None,
         stream: StreamBus | None = None,
     ) -> Block | None:
+        """Regenerate one block while respecting spine reconfiguration."""
+        runtime, current_task = await self._register_foreground_operation(book_id, stream)
+        try:
+            return await self._regenerate_block(
+                book_id=book_id,
+                page_id=page_id,
+                block_id=block_id,
+                params_override=params_override,
+                stream=stream,
+            )
+        finally:
+            if current_task is not None:
+                async with runtime.lock:
+                    runtime.active_operations.discard(current_task)
+
+    async def _regenerate_block(
+        self,
+        *,
+        book_id: str,
+        page_id: str,
+        block_id: str,
+        params_override: dict[str, Any] | None = None,
+        stream: StreamBus | None = None,
+    ) -> Block | None:
         """Re-run a single block generator (e.g. user clicked 'regenerate')."""
         book = self.storage.load_book(book_id)
         spine = self.storage.load_spine(book_id)
@@ -1167,6 +1191,34 @@ class BookEngine:
     # ── Block CRUD operations (Phase 3) ────────────────────────────────
 
     async def insert_block(
+        self,
+        *,
+        book_id: str,
+        page_id: str,
+        block_type: BlockType,
+        params: dict[str, Any] | None = None,
+        position: int | None = None,
+        stream: StreamBus | None = None,
+        compile_now: bool = True,
+    ) -> Block | None:
+        """Insert a block while respecting spine reconfiguration."""
+        runtime, current_task = await self._register_foreground_operation(book_id, stream)
+        try:
+            return await self._insert_block(
+                book_id=book_id,
+                page_id=page_id,
+                block_type=block_type,
+                params=params,
+                position=position,
+                stream=stream,
+                compile_now=compile_now,
+            )
+        finally:
+            if current_task is not None:
+                async with runtime.lock:
+                    runtime.active_operations.discard(current_task)
+
+    async def _insert_block(
         self,
         *,
         book_id: str,
