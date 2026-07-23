@@ -88,8 +88,15 @@ class _BookRuntime:
     queue: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
     queued: set[str] = field(default_factory=set)
     worker: asyncio.Task[None] | None = None
+    active_operations: set[asyncio.Task[Any]] = field(default_factory=set)
+    reconfiguration_depth: int = 0
+    reconfiguration_done: asyncio.Event = field(default_factory=asyncio.Event)
+    reconfiguration_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     stream: BookStream | None = None  # default stream for background work
+
+    def __post_init__(self) -> None:
+        self.reconfiguration_done.set()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,10 +139,39 @@ class BookEngine:
         return self.storage.load_spine(book_id)
 
     def list_pages(self, book_id: str) -> list[Page]:
-        return self.storage.list_pages(book_id)
+        pages = self.storage.list_pages(book_id)
+        spine = self.storage.load_spine(book_id)
+        if spine is None:
+            return pages
+        chapter_ids = {chapter.id for chapter in spine.chapters}
+        return [page for page in pages if page.chapter_id in chapter_ids]
 
     def load_page(self, book_id: str, page_id: str) -> Page | None:
-        return self.storage.load_page(book_id, page_id)
+        page = self.storage.load_page(book_id, page_id)
+        if page is None:
+            return None
+        spine = self.storage.load_spine(book_id)
+        if spine is not None and spine.chapter_by_id(page.chapter_id) is None:
+            return None
+        return page
+
+    def _remove_orphan_pages(self, book_id: str, spine: Spine) -> list[str]:
+        """Delete pages whose chapter no longer exists in the confirmed spine."""
+        chapter_ids = {chapter.id for chapter in spine.chapters}
+        orphan_ids = [
+            page.id
+            for page in self.storage.list_pages(book_id)
+            if page.chapter_id not in chapter_ids
+        ]
+        for page_id in orphan_ids:
+            self.storage.delete_page(book_id, page_id)
+        if orphan_ids:
+            self.storage.append_log(
+                book_id,
+                f"removed {len(orphan_ids)} orphan book page(s)",
+                op="cleanup",
+            )
+        return orphan_ids
 
     def load_progress(self, book_id: str) -> Progress:
         progress = self.storage.load_progress(book_id)
@@ -149,6 +185,70 @@ class BookEngine:
         if runtime and runtime.worker and not runtime.worker.done():
             runtime.worker.cancel()
         return self.storage.delete_book(book_id)
+
+    async def _begin_book_reconfiguration(self, book_id: str) -> None:
+        """Block new compilation and stop active work before changing a spine."""
+        runtime = await self._get_or_create_runtime(book_id, None)
+        await runtime.reconfiguration_lock.acquire()
+
+        current_task = asyncio.current_task()
+        tasks_to_wait: set[asyncio.Task[Any]] = set()
+        async with runtime.lock:
+            runtime.reconfiguration_depth += 1
+            runtime.reconfiguration_done.clear()
+            worker = runtime.worker
+            if worker is not None and not worker.done() and worker is not current_task:
+                tasks_to_wait.add(worker)
+            tasks_to_wait.update(
+                task
+                for task in runtime.active_operations
+                if not task.done() and task is not current_task
+            )
+            for task in tasks_to_wait:
+                task.cancel()
+            runtime.worker = None
+            runtime.queued.clear()
+            while not runtime.queue.empty():
+                try:
+                    runtime.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+        if tasks_to_wait:
+            await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+
+    async def _end_book_reconfiguration(self, book_id: str) -> None:
+        """Allow compilation again after spine and page state are consistent."""
+        runtime = self._runtimes.get(book_id)
+        if runtime is None:
+            return
+
+        async with runtime.lock:
+            runtime.reconfiguration_depth = max(0, runtime.reconfiguration_depth - 1)
+            if runtime.reconfiguration_depth:
+                runtime.reconfiguration_lock.release()
+                return
+            runtime.reconfiguration_done.set()
+            if not runtime.queue.empty():
+                self._ensure_worker(book_id)
+            runtime.reconfiguration_lock.release()
+
+    async def _register_foreground_operation(
+        self, book_id: str, stream: StreamBus | None
+    ) -> tuple[_BookRuntime, asyncio.Task[Any] | None]:
+        """Register a foreground compile after any spine reconfiguration ends."""
+        runtime = await self._get_or_create_runtime(book_id, stream)
+        current_task = asyncio.current_task()
+        if current_task is None:
+            return runtime, None
+
+        while True:
+            async with runtime.lock:
+                if runtime.reconfiguration_depth == 0:
+                    runtime.active_operations.add(current_task)
+                    return runtime, current_task
+                reconfiguration_done = runtime.reconfiguration_done
+            await reconfiguration_done.wait()
 
     def set_page_chat_session(self, *, book_id: str, page_id: str, session_id: str) -> Book | None:
         """Persist the chat session associated with a specific book page."""
@@ -587,6 +687,26 @@ class BookEngine:
         stream: StreamBus | None = None,
         auto_compile: bool = True,
     ) -> list[Page]:
+        """Confirm a spine while fencing all stale book compilation."""
+        await self._begin_book_reconfiguration(book_id)
+        try:
+            return await self._confirm_spine(
+                book_id=book_id,
+                edited_spine=edited_spine,
+                stream=stream,
+                auto_compile=auto_compile,
+            )
+        finally:
+            await self._end_book_reconfiguration(book_id)
+
+    async def _confirm_spine(
+        self,
+        *,
+        book_id: str,
+        edited_spine: Spine | None = None,
+        stream: StreamBus | None = None,
+        auto_compile: bool = True,
+    ) -> list[Page]:
         """User confirms (or edits) the spine → create pending page shells.
 
         BookEngine v2: automatically injects an **Overview** chapter at order 0
@@ -608,6 +728,7 @@ class BookEngine:
         # ── Inject Overview chapter (idempotent) ─────────────────────
         spine = await self._ensure_overview_chapter(spine, book, stream=stream)
         self.storage.save_spine(spine)
+        self._remove_orphan_pages(book_id, spine)
 
         existing = {p.chapter_id: p for p in self.storage.list_pages(book_id)}
         pages: list[Page] = []
@@ -651,24 +772,29 @@ class BookEngine:
         stream: StreamBus | None = None,
         auto_compile: bool = True,
     ) -> list[Page]:
+        """Rebuild pages while fencing stale foreground and background work."""
+        await self._begin_book_reconfiguration(book_id)
+        try:
+            return await self._rebuild_book(
+                book_id=book_id,
+                stream=stream,
+                auto_compile=auto_compile,
+            )
+        finally:
+            await self._end_book_reconfiguration(book_id)
+
+    async def _rebuild_book(
+        self,
+        *,
+        book_id: str,
+        stream: StreamBus | None = None,
+        auto_compile: bool = True,
+    ) -> list[Page]:
         """Regenerate all pages while preserving the confirmed proposal/spine."""
         book = self.storage.load_book(book_id)
         spine = self.storage.load_spine(book_id)
         if book is None or spine is None:
             raise ValueError(f"Cannot rebuild book – missing book/spine ({book_id})")
-
-        runtime = self._runtimes.get(book_id)
-        if runtime is not None:
-            async with runtime.lock:
-                if runtime.worker is not None and not runtime.worker.done():
-                    runtime.worker.cancel()
-                    runtime.worker = None
-                runtime.queued.clear()
-                while not runtime.queue.empty():
-                    try:
-                        runtime.queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
 
         for page in self.storage.list_pages(book_id):
             self.storage.delete_page(book_id, page.id)
@@ -687,7 +813,7 @@ class BookEngine:
             op="rebuild",
         )
 
-        return await self.confirm_spine(
+        return await self._confirm_spine(
             book_id=book_id,
             edited_spine=spine,
             stream=stream,
@@ -697,6 +823,28 @@ class BookEngine:
     # ── Stage 3-4: compile a single page (current page) ──────────────────
 
     async def compile_page(
+        self,
+        *,
+        book_id: str,
+        page_id: str,
+        stream: StreamBus | None = None,
+        force: bool = False,
+    ) -> Page:
+        """Track and drive the foreground compiler for one page."""
+        runtime, current_task = await self._register_foreground_operation(book_id, stream)
+        try:
+            return await self._compile_page(
+                book_id=book_id,
+                page_id=page_id,
+                stream=stream,
+                force=force,
+            )
+        finally:
+            if current_task is not None:
+                async with runtime.lock:
+                    runtime.active_operations.discard(current_task)
+
+    async def _compile_page(
         self,
         *,
         book_id: str,
@@ -825,6 +973,8 @@ class BookEngine:
     def _ensure_worker(self, book_id: str) -> None:
         runtime = self._runtimes.get(book_id)
         if runtime is None:
+            return
+        if runtime.reconfiguration_depth:
             return
         if runtime.worker is not None and not runtime.worker.done():
             return
