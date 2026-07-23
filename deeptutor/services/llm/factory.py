@@ -476,7 +476,7 @@ async def stream(
         await queue.put(chunk)
 
     async def _runner() -> None:
-        nonlocal in_think_block
+        nonlocal in_think_block, saw_output
         try:
             response = await provider.chat_stream_with_retry(
                 messages=request_messages,

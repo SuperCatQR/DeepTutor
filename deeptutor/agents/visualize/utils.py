@@ -56,6 +56,20 @@ def is_valid_html_document(html: str) -> bool:
     return "<html" in lowered or "<!doctype" in lowered or "<body" in lowered or "<div" in lowered
 
 
+def validate_self_contained_html(html: str) -> tuple[bool, str]:
+    """Require a complete HTML document for interactive book blocks."""
+    text = _strip_outer_fence(html)
+    lowered = text.lower()
+    required_tags = (
+        ("<html", "</html>", "an <html> root element"),
+        ("<body", "</body>", "a complete <body> element"),
+    )
+    for opening, closing, description in required_tags:
+        if opening not in lowered or closing not in lowered:
+            return False, f"HTML must contain {description}."
+    return True, ""
+
+
 def build_fallback_html(*, title: str, summary: str = "", note: str = "") -> str:
     """Build a minimal, self-contained fallback HTML page.
 
@@ -186,5 +200,6 @@ __all__ = [
     "extract_code_block",
     "extract_json_object",
     "is_valid_html_document",
+    "validate_self_contained_html",
     "validate_visualization",
 ]

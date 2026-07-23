@@ -63,6 +63,7 @@ class FigureGenerator(BlockGenerator):
                 base_url=llm_config.base_url,
                 api_version=llm_config.api_version,
                 language=ctx.language,
+                retry_attempts=2,
             )
             analysis = await pipeline.run_analysis(
                 user_input=user_input,
@@ -73,6 +74,7 @@ class FigureGenerator(BlockGenerator):
                 user_input=user_input,
                 history_context=history_context,
                 analysis=analysis,
+                validator=lambda value: validate_visualization(value, analysis.render_type)[0],
             )
             ok, validation_error = validate_visualization(code, analysis.render_type)
             if ok:

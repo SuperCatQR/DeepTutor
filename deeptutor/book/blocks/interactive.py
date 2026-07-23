@@ -54,7 +54,7 @@ class InteractiveGenerator(BlockGenerator):
 
         try:
             from deeptutor.agents.visualize.pipeline import VisualizePipeline
-            from deeptutor.agents.visualize.utils import validate_visualization
+            from deeptutor.agents.visualize.utils import validate_self_contained_html
             from deeptutor.services.llm.config import get_llm_config
 
             llm_config = get_llm_config()
@@ -63,6 +63,7 @@ class InteractiveGenerator(BlockGenerator):
                 base_url=llm_config.base_url,
                 api_version=llm_config.api_version,
                 language=ctx.language,
+                retry_attempts=2,
             )
             analysis = await pipeline.run_analysis(
                 user_input=user_input,
@@ -73,12 +74,13 @@ class InteractiveGenerator(BlockGenerator):
                 user_input=user_input,
                 history_context=history_context,
                 analysis=analysis,
+                validator=lambda value: validate_self_contained_html(value)[0],
             )
         except Exception as exc:
             logger.warning(f"InteractiveGenerator failed: {exc}", exc_info=True)
             raise GenerationFailure(f"interactive generation failed: {exc}") from exc
 
-        ok, validation_error = validate_visualization(code, "html")
+        ok, validation_error = validate_self_contained_html(code)
         if not ok:
             raise GenerationFailure(f"interactive html failed validation: {validation_error}")
 

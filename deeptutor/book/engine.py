@@ -132,10 +132,39 @@ class BookEngine:
         return self.storage.load_spine(book_id)
 
     def list_pages(self, book_id: str) -> list[Page]:
-        return self.storage.list_pages(book_id)
+        pages = self.storage.list_pages(book_id)
+        spine = self.storage.load_spine(book_id)
+        if spine is None:
+            return pages
+        chapter_ids = {chapter.id for chapter in spine.chapters}
+        return [page for page in pages if page.chapter_id in chapter_ids]
 
     def load_page(self, book_id: str, page_id: str) -> Page | None:
-        return self.storage.load_page(book_id, page_id)
+        page = self.storage.load_page(book_id, page_id)
+        if page is None:
+            return None
+        spine = self.storage.load_spine(book_id)
+        if spine is not None and spine.chapter_by_id(page.chapter_id) is None:
+            return None
+        return page
+
+    def _remove_orphan_pages(self, book_id: str, spine: Spine) -> list[str]:
+        """Delete pages whose chapter no longer exists in the confirmed spine."""
+        chapter_ids = {chapter.id for chapter in spine.chapters}
+        orphan_ids = [
+            page.id
+            for page in self.storage.list_pages(book_id)
+            if page.chapter_id not in chapter_ids
+        ]
+        for page_id in orphan_ids:
+            self.storage.delete_page(book_id, page_id)
+        if orphan_ids:
+            self.storage.append_log(
+                book_id,
+                f"removed {len(orphan_ids)} orphan book page(s)",
+                op="cleanup",
+            )
+        return orphan_ids
 
     def load_progress(self, book_id: str) -> Progress:
         progress = self.storage.load_progress(book_id)
@@ -149,6 +178,32 @@ class BookEngine:
         if runtime and runtime.worker and not runtime.worker.done():
             runtime.worker.cancel()
         return self.storage.delete_book(book_id)
+
+    async def _cancel_book_worker(self, book_id: str) -> None:
+        """Stop and await queued compilation before replacing a book spine."""
+        runtime = self._runtimes.get(book_id)
+        if runtime is None:
+            return
+
+        worker_to_wait: asyncio.Task[None] | None = None
+        async with runtime.lock:
+            worker = runtime.worker
+            if worker is not None and not worker.done():
+                worker.cancel()
+                worker_to_wait = worker
+            runtime.worker = None
+            runtime.queued.clear()
+            while not runtime.queue.empty():
+                try:
+                    runtime.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+        if worker_to_wait is not None:
+            try:
+                await worker_to_wait
+            except asyncio.CancelledError:
+                pass
 
     def set_page_chat_session(self, *, book_id: str, page_id: str, session_id: str) -> Book | None:
         """Persist the chat session associated with a specific book page."""
@@ -601,6 +656,7 @@ class BookEngine:
         spine = edited_spine or self.storage.load_spine(book_id)
         if spine is None:
             raise ValueError(f"No spine for book {book_id}")
+        await self._cancel_book_worker(book_id)
         if edited_spine is not None:
             spine.book_id = book_id
             self.storage.save_spine(spine)
@@ -608,6 +664,7 @@ class BookEngine:
         # ── Inject Overview chapter (idempotent) ─────────────────────
         spine = await self._ensure_overview_chapter(spine, book, stream=stream)
         self.storage.save_spine(spine)
+        self._remove_orphan_pages(book_id, spine)
 
         existing = {p.chapter_id: p for p in self.storage.list_pages(book_id)}
         pages: list[Page] = []
@@ -657,18 +714,7 @@ class BookEngine:
         if book is None or spine is None:
             raise ValueError(f"Cannot rebuild book – missing book/spine ({book_id})")
 
-        runtime = self._runtimes.get(book_id)
-        if runtime is not None:
-            async with runtime.lock:
-                if runtime.worker is not None and not runtime.worker.done():
-                    runtime.worker.cancel()
-                    runtime.worker = None
-                runtime.queued.clear()
-                while not runtime.queue.empty():
-                    try:
-                        runtime.queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
+        await self._cancel_book_worker(book_id)
 
         for page in self.storage.list_pages(book_id):
             self.storage.delete_page(book_id, page.id)
