@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from html.parser import HTMLParser
 import json
 import re
 
@@ -30,6 +31,127 @@ _MERMAID_KEYWORDS = (
     "block-beta",
     "C4Context",
 )
+
+_VOID_HTML_TAGS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
+
+
+class _CompleteHTMLDocumentParser(HTMLParser):
+    """Validate the nesting required for an interactive HTML document."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.stack: list[str] = []
+        self.error: str = ""
+        self.root_seen = False
+        self.body_seen = False
+        self.body_open = False
+        self.body_closed = False
+        self.html_closed = False
+
+    def _fail(self, message: str) -> None:
+        if not self.error:
+            self.error = message
+
+    def handle_decl(self, decl: str) -> None:
+        if self.root_seen:
+            self._fail("DOCTYPE must appear before the <html> root element.")
+        elif decl.strip().lower() != "doctype html":
+            self._fail("DOCTYPE must be <!DOCTYPE html>.")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if self.error:
+            return
+        if tag == "html":
+            if self.root_seen or self.stack:
+                self._fail("HTML must have one top-level <html> root element.")
+                return
+            self.root_seen = True
+            self.stack.append(tag)
+            return
+        if not self.root_seen or self.html_closed:
+            self._fail("HTML content must be inside one <html> root element.")
+            return
+        if tag == "head":
+            if self.body_seen or self.stack != ["html"]:
+                self._fail("<head> must be an unclosed <html> child before <body>.")
+                return
+            self.stack.append(tag)
+            return
+        if tag == "body":
+            if self.body_seen or self.stack != ["html"]:
+                self._fail("<body> must be one direct child of <html>.")
+                return
+            self.body_seen = True
+            self.body_open = True
+            self.stack.append(tag)
+            return
+        if not self.stack:
+            self._fail("HTML content must be inside the <html> root element.")
+            return
+        if not self.body_open and self.stack[-1] != "head":
+            self._fail("Visible document content must be inside <body>.")
+            return
+        if tag not in _VOID_HTML_TAGS:
+            self.stack.append(tag)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in _VOID_HTML_TAGS:
+            self._fail(f"<{tag} /> is not a valid self-closing HTML element.")
+            return
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.error:
+            return
+        if tag in _VOID_HTML_TAGS:
+            self._fail(f"Void element <{tag}> must not have a closing tag.")
+            return
+        if not self.stack or self.stack[-1] != tag:
+            self._fail(f"Closing tag </{tag}> does not match the open HTML structure.")
+            return
+        self.stack.pop()
+        if tag == "body":
+            self.body_open = False
+            self.body_closed = True
+        elif tag == "html":
+            if not self.body_closed:
+                self._fail("<html> must contain a complete <body> element.")
+                return
+            self.html_closed = True
+
+    def handle_data(self, data: str) -> None:
+        if data.strip() and (not self.root_seen or self.html_closed):
+            self._fail("Text must be inside the HTML document.")
+
+    def document_error(self) -> str:
+        """Return the first structural error, if the document is incomplete."""
+        if self.error:
+            return self.error
+        if not self.root_seen:
+            return "HTML must contain one <html> root element."
+        if not self.body_seen or not self.body_closed:
+            return "HTML must contain a complete <body> element."
+        if self.stack or not self.html_closed:
+            return "HTML document is not properly closed."
+        return ""
 
 
 def extract_code_block(text: str, language: str = "") -> str:
@@ -106,6 +228,31 @@ def _strip_outer_fence(text: str) -> str:
     stripped = (text or "").strip()
     match = re.match(r"^```[A-Za-z]*\s*\n?([\s\S]*?)\n?```$", stripped)
     return match.group(1).strip() if match else stripped
+
+
+def validate_self_contained_html(html: str) -> tuple[bool, str]:
+    """Validate that interactive output is one complete HTML document.
+
+    Args:
+        html: Model-generated HTML, optionally wrapped in one fenced code block.
+
+    Returns:
+        A pair containing whether the document is structurally complete and a
+        concise error message when it is not.
+    """
+    text = _strip_outer_fence(html)
+    if not text:
+        return False, "Generated HTML is empty."
+
+    parser = _CompleteHTMLDocumentParser()
+    try:
+        parser.feed(text)
+        parser.close()
+    except Exception as exc:  # noqa: BLE001
+        return False, f"HTML could not be parsed: {exc}"
+
+    error = parser.document_error()
+    return not error, error
 
 
 def validate_visualization(code: str, render_type: str) -> tuple[bool, str]:
@@ -186,5 +333,6 @@ __all__ = [
     "extract_code_block",
     "extract_json_object",
     "is_valid_html_document",
+    "validate_self_contained_html",
     "validate_visualization",
 ]

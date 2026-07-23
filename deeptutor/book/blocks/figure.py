@@ -53,7 +53,10 @@ class FigureGenerator(BlockGenerator):
 
         try:
             from deeptutor.agents.visualize.models import ReviewResult
-            from deeptutor.agents.visualize.pipeline import VisualizePipeline
+            from deeptutor.agents.visualize.pipeline import (
+                BOOK_GENERATION_RETRY_ATTEMPTS,
+                VisualizePipeline,
+            )
             from deeptutor.agents.visualize.utils import validate_visualization
             from deeptutor.services.llm.config import get_llm_config
 
@@ -63,6 +66,7 @@ class FigureGenerator(BlockGenerator):
                 base_url=llm_config.base_url,
                 api_version=llm_config.api_version,
                 language=ctx.language,
+                retry_attempts=BOOK_GENERATION_RETRY_ATTEMPTS,
             )
             analysis = await pipeline.run_analysis(
                 user_input=user_input,
@@ -73,6 +77,7 @@ class FigureGenerator(BlockGenerator):
                 user_input=user_input,
                 history_context=history_context,
                 analysis=analysis,
+                validator=lambda value: validate_visualization(value, analysis.render_type)[0],
             )
             ok, validation_error = validate_visualization(code, analysis.render_type)
             if ok:

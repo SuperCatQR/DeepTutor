@@ -166,6 +166,30 @@ async def test_stream_does_not_replay_reasoning_as_final_content(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_stream_surfaces_provider_error_without_unbound_local_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_cfg()
+    provider = _FakeProvider(
+        stream_chunk="",
+        stream_response=LLMResponse(
+            content="",
+            finish_reason="error",
+        ),
+    )
+
+    monkeypatch.setattr("deeptutor.services.llm.factory.get_llm_config", lambda: cfg)
+    monkeypatch.setattr(
+        "deeptutor.services.llm.factory.get_runtime_provider",
+        lambda _config: provider,
+    )
+
+    with pytest.raises(Exception, match="LLM request failed"):
+        async for _ in stream("hello"):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_complete_injects_openai_image_parts(monkeypatch) -> None:
     cfg = _make_cfg(model="gpt-4o-mini", binding="openai", provider_name="openai")
     provider = _FakeProvider()
