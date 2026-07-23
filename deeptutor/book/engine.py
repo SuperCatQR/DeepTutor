@@ -214,8 +214,16 @@ class BookEngine:
                 except asyncio.QueueEmpty:
                     break
 
-        if tasks_to_wait:
-            await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+        try:
+            if tasks_to_wait:
+                await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+        except BaseException:
+            async with runtime.lock:
+                runtime.reconfiguration_depth = max(0, runtime.reconfiguration_depth - 1)
+                if runtime.reconfiguration_depth == 0:
+                    runtime.reconfiguration_done.set()
+                    runtime.reconfiguration_lock.release()
+            raise
 
     async def _end_book_reconfiguration(self, book_id: str) -> None:
         """Allow compilation again after spine and page state are consistent."""
